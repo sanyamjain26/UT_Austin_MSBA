@@ -1,0 +1,291 @@
+---
+title: "IA 3 - SANYAM JAIN (sj33448)"
+output:
+  html_document:
+    df_print: paged
+---
+***
+<center> 
+### Demand Models Laboratory.
+#### (Total 40 pts.)
+#### Due: Dec. 5 
+</center>
+***
+
+In this assignment you will produce a forecast for sales of carbonated beverages at a supermarket based on real weekly sales information of items in the category for a period of two years. This information is contained in the following three files:
+
+* **CarbBev_IA3.RDS**  This is the listing of weekly sales and the corresponding promotional variables for each product at the store.
+
+* **Carb Bev UPC.csv**  This includes product information for the different product UPC codes that you will find in the **CarbBev_IA3.RDS** file.
+
+* **Data Measure Definitions.docx**  This is a file with descriptions of the columns you will find in the **CarbBev_IA3.RDS** file.
+
+Please take a few minutes to get acquainted with the data.
+```{r}
+library(tidyverse)
+
+X <- readRDS("Carb_Bev_IA3.RDS") %>% 
+  mutate(P  = DOLLARS/UNITS) %>% 
+  select(-DOLLARS)
+
+U <- U <- read.csv("Carb_Bev_Prod_UPC.csv") %>% 
+  as_tibble %>% 
+  mutate(UPC = as.factor(UPC))
+```
+
+To make the project more concrete, you will develop a demand model for product UPC = *00-01-12000-80995* and use products UPC = *00-01-49000-02891*  and UPC = *00-01-78000-08316* as potential product substitutes, which corresponds to the following description:
+```{r}
+U %>% 
+  filter(UPC == "00-01-49000-02891" |
+         UPC == "00-01-12000-80995" |
+         UPC == "00-01-78000-08316") 
+```
+
+Our goal is to create a log-log model and *if necessary* embed the demand model in an ARIMA model (Regression with ARIMA errors) that accounts for the auto-correlations in the sales data.  As a first attempt we would like to include a demand function of the following form:
+
+$$y=e^{βx} p^α q_1^{γ_1} q_2^{γ_2}$$
+
+Where the model variables and parameters are defined as follows:
+
+* $y$ :	Demand (sales volume)
+* $p$ :	Price per unit of the focal product.
+* $q_i$ :	Price per unit of substitute products.
+* $x$ :	Vector of weighted averages of advertising and display variables for each product
+* $β$ :	Vector of coefficients for advertising and display variables
+* $α,γ_1,γ_2$:	Coefficients (elasticity and cross-elasticities) of prices
+
+We have a total of 104 weeks of data.  In this assignment we will use weeks 1 (WEEK = 31) through 94 (WEEK = 1624) as a training set and weeks 95 (WEEK = 1625) through 104 (WEEK = 1634) as a testing set.
+
+
+#### Q1. Create a data set appropriate for the above model (i.e., subset and wrangle the appropriate variables in correct position to execute a simple linear regression model)  Then run a TSLM model using only the prices (i.e., $y= p^α$) and examine the results you obtain.  Comment on the validity of the model. Plot the time-series of *UNITS* and overly the corresponding time series of fitted values, then comment on the fit of the model. What is the price-elasticity of demand according to this model?**
+
+#### Ans1:  
+
+```{r}
+library(dplyr)
+library(fpp3)
+X %>%  
+  filter(UPC == "00-01-12000-80995") -> XR
+
+X %>% 
+  filter(UPC == "00-01-49000-02891" | 
+         UPC == "00-01-78000-08316" ) %>% 
+  select(WEEK, ITEM, D, PR, FEAT, P) %>% 
+  pivot_wider(names_from = ITEM,
+              values_from = c(D, PR, FEAT, P)) %>% 
+  select_if(~sum(is.na(.)) == 0) %>% 
+  left_join(XR,.,by = "WEEK") %>% 
+  as_tsibble(index = WEEK) -> XR
+
+TR <- XR %>% filter(WEEK <= 1624)
+TE <- XR %>% filter(WEEK >= 1625)
+```
+
+```{r}
+mod_simple_linear_reg <- TR %>% 
+  model(m = TSLM(log(UNITS) ~ log(P)))
+
+mod_simple_linear_reg %>% 
+  augment %>%
+  features(.resid, ljung_box, lag = 10)
+
+mod_simple_linear_reg %>% report()
+```
+
+
+```{r}
+TE %>% select(D, P, FEAT) -> prediction_data
+
+
+mod_simple_linear_reg %>%
+  forecast(new_data = prediction_data) -> forecast_simple_linear
+
+
+fitted_data_linear <- mod_simple_linear_reg %>% 
+  augment()
+
+forecast_simple_linear %>%
+  autoplot() +
+  geom_line(data = TR, mapping = aes(y = UNITS)) +
+  geom_point(data = fitted_data_linear, mapping = aes(y = .fitted), col = "magenta") +
+  geom_point(data = TE, mapping = aes(y = UNITS), col = "green")
+
+
+```
+
+Model Validity:
+
+The Ljung-Box test results indicate that our model is reliable since the p-value is near 1. Additionally, comparing the actual values with the fitted values in the time-series plot shows that our model fits well in most cases, though it struggles to accurately predict certain peaks in demand.
+
+Demand Price Elasticity:
+
+The calculated price elasticity of demand suggests that for each one percent change in price, the demand or sales units change by 4.6%. This figure is derived from the coefficient of log(P) in our model, where the response variable is log(UNITS).
+
+
+
+#### Q2. Use the training set to fit LASSO regression model (i.e., use the **glmnet** R package ) that includes as candidate model features all the prices, advertisement/promotion and feature variables and their cross-products. Report the set of non-zero coefficients for the lasso solutions corresponding to $\lambda_{min}$ and $\lambda_{1se}$.  
+
+#### Ans 2:  
+
+```{r}
+library(glmnet)
+features_matrix <- model.matrix(~ . - 1 - UPC - VEND - ITEM - UNITS, data = TR 
+                  %>% mutate(FEAT = factor(FEAT, levels = setdiff(unique(FEAT), c("A+", "C"))),FEAT_2891 = factor(FEAT_2891, levels = setdiff(unique(FEAT_2891), c("A+", "C"))),FEAT_8316 = factor(FEAT_8316, levels = setdiff(unique(FEAT_8316), c("A+", "C"))) ) )
+target_log_units <- log(TR$UNITS)
+
+features_matrix <- scale(features_matrix)
+
+set.seed(8)  
+crossval_model <- cv.glmnet(features_matrix, target_log_units, alpha = 1)
+
+# Extracting coefficients
+coefficients_min_lambda <- coef(crossval_model, s = "lambda.min")
+coefficients_1se_lambda <- coef(crossval_model, s = "lambda.1se")
+
+# Isolating non-zero coefficients
+non_zero_coeffs_min_lambda <- as.matrix(coefficients_min_lambda)
+non_zero_coeffs_min_lambda <- non_zero_coeffs_min_lambda[non_zero_coeffs_min_lambda[, 1] != 0, , drop = FALSE]
+non_zero_coeffs_min_lambda <- as.data.frame(non_zero_coeffs_min_lambda)
+
+non_zero_coeffs_1se_lambda <- as.matrix(coefficients_1se_lambda)
+non_zero_coeffs_1se_lambda <- non_zero_coeffs_1se_lambda[non_zero_coeffs_1se_lambda[, 1] != 0, , drop = FALSE]
+non_zero_coeffs_1se_lambda <- as.data.frame(non_zero_coeffs_1se_lambda)
+
+cat("Non-zero coefficients at lambda.min:\n")
+print(non_zero_coeffs_min_lambda)
+cat("\nNon-zero coefficients at lambda.1se:\n")
+print(non_zero_coeffs_1se_lambda)
+
+```
+Non Zero coefficients for lambda min: D1,LOG_P,PR1 & FEATNONE
+Non Zero coefficients for lambda lse: D1,LOG_P & FEATNONE
+
+#### Q3.  Use the training set to fit an unrestricted TSLM regression model on the reduced set of explanatory variables identified by The LASSO.  Report the coefficients of the full model and comment on the fit of the model and examine the auto-correlations of the residuals of this model. If necessary enhance the reduced model as a regression with ARIMA errors.
+
+#### Ans3:  
+
+```{r}
+
+selected_features_min_lambda <- rownames(non_zero_coeffs_min_lambda)[-1] 
+selected_features_1se_lambda <- rownames(non_zero_coeffs_1se_lambda)[-1]
+
+
+unique_selected_features <- unique(c(selected_features_min_lambda, selected_features_1se_lambda))
+
+
+log_units_formula <- as.formula(paste("log(UNITS) ~", paste(unique_selected_features, collapse = " + ")))
+
+
+formatted_training_data <- as.data.frame(model.matrix(~ . - 1 - UPC - VEND - ITEM, data = TR 
+                  %>% mutate(FEAT = factor(FEAT, levels = setdiff(unique(FEAT), c("A+", "C"))),
+                             FEAT_2891 = factor(FEAT_2891, levels = setdiff(unique(FEAT_2891), c("A+", "C"))),
+                             FEAT_8316 = factor(FEAT_8316, levels = setdiff(unique(FEAT_8316), c("A+", "C"))) ) ))
+
+
+linear_model_log_units <- lm(log_units_formula, data = formatted_training_data)
+
+
+summary(linear_model_log_units)
+```
+
+Based on the summary output, the linear model seems to fit the data well. With a multiple R-squared value of 0.855, a significant amount of the variance in the target variable is explained by the model. The presence of statistically significant coefficients for predictors like "D," "FEATNONE," and "P" indicates that these variables significantly contribute to the model's effectiveness in accounting for variations in the target variable.
+
+```{r}
+linear_model_log_units <- residuals(linear_model_log_units)
+
+acf(linear_model_log_units)
+
+Box.test(linear_model_log_units, lag = 10, type = "Ljung-Box")
+```
+
+The ACF (Autocorrelation Function) indicates notable autocorrelation at the first lag, while the Ljung-Box test, with a p-value greater than 0.05, does not suggest significant autocorrelation at subsequent lags. This implies that while there's some autocorrelation at the first lag, it's not statistically significant at other lags. Given these observations, it might be beneficial to consider adding an autoregressive (AR) element to the model, specifically to address the residual autocorrelation at the first lag. Employing an ARIMA (AutoRegressive Integrated Moving Average) model, which includes an AR component, could enhance the model's capacity to accommodate the observed autocorrelation in the residuals, leading to a more accurate model fit.
+
+
+```{r}
+
+autoregressive_model <- arima(linear_model_log_units, order = c(1, 0, 0))
+formatted_training_data$AutoregModel_Residuals <- residuals(autoregressive_model)
+
+integrated_linear_model <- lm(log(UNITS) ~ WEEK + D + FEATNONE + P + AutoregModel_Residuals, data = formatted_training_data)
+
+summary(integrated_linear_model)
+
+```
+
+
+The statistics from the integrated model demonstrate a marked enhancement in performance over the initial linear regression approach. The integrated model now accounts for a substantially greater proportion of the variance in the response variable (log(UNITS)). Furthermore, the predictors, inclusive of the ARIMA residuals, show highly significant coefficients (p < 0.001), reflecting strong associations with the response variable. This improvement implies that the addition of the ARIMA element has significantly bolstered the model's capacity to discern underlying trends in the dataset, leading to a model with superior predictive accuracy.
+
+
+#### Q4. Plot as a time-series the product demand (UNITS) and fitted values over the training period, and then the forecast and the actual values over the test period.  Compare this plot to the corresponding one in Question 1, and comment on the improvement.  
+
+#### Ans 4:  
+
+```{r}
+
+formatted_training_data$Forecasted_Units <- exp(predict(integrated_linear_model, newdata = formatted_training_data))
+
+
+training_period_plot <- ggplot(formatted_training_data, aes(x = WEEK)) +
+  geom_line(aes(y = UNITS, color = "Actual Data"), size = 1) +
+  geom_line(aes(y = Forecasted_Units, color = "Model Prediction"), size = 1, linetype = "dashed") +
+  labs(title = "Training Period: Actual vs. Model Predictions",
+       x = "Week",
+       y = "Units Sold") +
+  scale_color_manual(values = c("Actual Data" = "green", "Model Prediction" = "magenta")) +
+  theme_minimal()
+
+training_period_plot
+
+
+```
+Reviewing both plots, it's clear that the regression model incorporating ARIMA errors aligns more closely with the actual values compared to previous models. This improved fit is especially visible in the plot where the red line, representing fitted values, closely follows the actual data's peaks and valleys. This suggests the model's enhanced ability to handle the time series' fluctuations. Moreover, the model effectively addresses autocorrelation in the data, leading to more precise forecasts and a noticeable reduction in residual variance. As a result, this model outperforms the basic linear model, proving to be a more dependable forecasting tool in this scenario.
+
+```{r}
+library(forecast)
+```
+
+
+```{r}
+TE$FEATNONE <- as.integer(TE$FEAT == "NONE")
+
+# Forecasting ARIMA residuals
+autoreg_residual_forecast <- forecast(autoregressive_model, h = length(TE$UNITS))
+forecasted_autoreg_residuals <- as.vector(autoreg_residual_forecast$mean)
+TE$AutoregModel_Residuals <- forecasted_autoreg_residuals
+
+TE$Predicted <- exp(predict(integrated_linear_model, newdata = TE))
+
+# Creating the test period plot
+testing_period_plot <- ggplot(TE, aes(x = WEEK)) +
+  geom_line(aes(y = UNITS, color = "Actual Data"), size = 1) +
+  geom_line(aes(y = Predicted, color = "Model Forecast"), size = 1, linetype = "dashed") +
+  labs(title = "Test Period: Actual Data vs. Model Forecast",
+       x = "Week",
+       y = "Units Sold") +
+  scale_color_manual(values = c("Actual Data" = "magenta", "Model Forecast" = "lightgreen")) +
+  theme_minimal()
+
+testing_period_plot
+
+```
+
+
+#### Q5. Examine the correlation matrix between all the predictive variables considered in your analysis and comment on how the observed correlation affects the results you obtained.  
+
+#### Ans 5:  
+
+```{r}
+
+formatted_training_data$LogUnitsSold <- log(formatted_training_data$UNITS)
+data_for_correlation_analysis <- formatted_training_data %>% 
+  select(LogUnitsSold, WEEK, D, FEATNONE, P, AutoregModel_Residuals)
+
+# Creating the correlation matrix
+correlation_analysis_matrix <- cor(data_for_correlation_analysis, use = "complete.obs")
+
+# Printing the correlation matrix
+print(correlation_analysis_matrix)
+
+```
+The correlation matrix highlights key relationships: a strong negative correlation between log demand and price, indicating higher prices lower demand, and a positive correlation between log demand and promotions, suggesting promotions boost demand. The negative correlation between log demand and the absence of features implies products without unique features are in higher demand. The low correlation of ARIMA residuals with other predictors shows the ARIMA model's effectiveness in capturing unique time series patterns.
+
